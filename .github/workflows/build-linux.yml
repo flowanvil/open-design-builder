@@ -11,7 +11,7 @@ on:
         required: false
         type: string
       force:
-        description: "With tag: rebuild even if that vX.Y.Z tag already exists"
+        description: "With tag: rebuild even if that version is already published"
         required: false
         type: boolean
         default: false
@@ -57,6 +57,14 @@ jobs:
             [ "$(printf '%s\n%s\n' "$older" "$newer" | sort -V | tail -n 1)" = "$newer" ]
           }
 
+          is_completed() {
+            local want="$1" x
+            for x in "${completed[@]:-}"; do
+              [ "$x" = "$want" ] && return 0
+            done
+            return 1
+          }
+
           # Upstream stable tags -> bare versions, ascending.
           upstream_raw="$(gh api "repos/${UPSTREAM_REPO}/tags?per_page=100" --paginate --jq '.[].name')"
           mapfile -t upstream_versions < <(printf '%s\n' "$upstream_raw" \
@@ -67,14 +75,23 @@ jobs:
             exit 1
           fi
 
-          # The highest vX.Y.Z tag already present in this repo is the cursor.
-          # Only upstream versions newer than it still need a release, so several
-          # tags published on the same day are all picked up, and older tags are
-          # never replayed.
-          built_raw="$(gh api "repos/${TARGET_REPO}/tags?per_page=100" --paginate --jq '.[].name')"
-          cursor="$(printf '%s\n' "$built_raw" \
-            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-            | sed 's/^v//' | sort -V | tail -n 1 || true)"
+          # Diff against COMPLETED builds, not bare tags. `gh release create`
+          # writes the vX.Y.Z tag before the assets finish uploading, so a tag
+          # left behind by a failed/partial upload is not a build. Only a release
+          # carrying BOTH expected assets counts; anything else is retried.
+          completed_raw="$(gh api "repos/${TARGET_REPO}/releases?per_page=100" --paginate --jq '
+            .[]
+            | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))
+            | (.tag_name | ltrimstr("v")) as $v
+            | select(([.assets[].name] | index("open-design-\($v)-linux-x64.AppImage")) != null)
+            | select(([.assets[].name] | index("open-design-\($v)-linux-x64.AppImage.sha256")) != null)
+            | $v
+          ')"
+          mapfile -t completed < <(printf '%s\n' "$completed_raw" | sed '/^$/d' | sort -V)
+          cursor=""
+          if [ "${#completed[@]}" -gt 0 ]; then
+            cursor="${completed[-1]}"
+          fi
 
           if [ -n "${INPUT_TAG:-}" ]; then
             # Accept v0.27.0, 0.27.0 or open-design-v0.27.0.
@@ -82,16 +99,26 @@ jobs:
             v="${v#v}"
             candidates=("$v")
           elif [ -z "$cursor" ]; then
-            # Fresh repo: bootstrap with only the newest upstream version instead
-            # of replaying the whole release history.
+            # No complete release yet: bootstrap with only the newest upstream
+            # version instead of replaying the whole release history.
             candidates=("${upstream_versions[-1]}")
-            echo "::notice::No vX.Y.Z tags in ${TARGET_REPO}; bootstrapping with ${candidates[0]}"
+            echo "::notice::No complete vX.Y.Z release in ${TARGET_REPO}; bootstrapping with ${candidates[0]}"
           else
+            # Set-style diff: every upstream version at or above the oldest
+            # complete release that has NO complete release here. This picks up
+            # same-day multi-tag releases and also repairs holes left by an
+            # earlier partial failure, without replaying ancient history below
+            # the floor. The matrix stays in ascending version order.
+            floor="${completed[0]}"
             candidates=()
             for v in "${upstream_versions[@]}"; do
-              if version_gt "$v" "$cursor"; then
-                candidates+=("$v")
+              if version_gt "$floor" "$v"; then
+                continue
               fi
+              if is_completed "$v"; then
+                continue
+              fi
+              candidates+=("$v")
             done
           fi
 
@@ -108,10 +135,9 @@ jobs:
               continue
             fi
 
-            # Idempotency: an already-tagged version is left alone unless forced.
-            if [ "${FORCE:-false}" != "true" ] \
-              && printf '%s\n' "$built_raw" | grep -qx "v${v}"; then
-              echo "::notice::${release_tag}: already tagged in ${TARGET_REPO}, skipping"
+            # Idempotency: a complete release is left alone unless forced.
+            if [ "${FORCE:-false}" != "true" ] && is_completed "$v"; then
+              echo "::notice::${release_tag}: already published with assets, skipping"
               continue
             fi
 
@@ -129,9 +155,11 @@ jobs:
 
           {
             echo "### Tags to build"
-            echo "Cursor (latest tag in this repo): \`${cursor:-none}\`"
+            echo "Cursor (latest complete release): \`${cursor:-none}\`"
+            echo "Floor (oldest complete release): \`${floor:-${cursor:-none}}\`"
+            echo "Complete releases: ${#completed[@]}"
             if [ "$count" -eq 0 ]; then
-              echo "Nothing to do — every upstream tag up to the cursor already has a release."
+              echo "Nothing to do — every upstream tag from the floor up has a complete release."
             else
               printf '%s' "$matrix" | jq -r '.include[].release_tag' | sed 's/^/- `/; s/$/`/'
             fi
@@ -142,9 +170,11 @@ jobs:
     needs: resolve
     if: needs.resolve.outputs.count != '0'
     strategy:
-      # One runner at a time, in version order — "依次打入" the missing tags.
+      # One runner at a time, in version order. Stop the chain at the first
+      # failure so a broken v0.28.0 never gets leapfrogged by a later v0.28.1
+      # (which would move the cursor past the hole and hide it forever).
       max-parallel: 1
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
@@ -229,3 +259,16 @@ jobs:
             gh release create "$RELEASE_TAG" dist/* --repo "$TARGET_REPO" \
               --title "$RELEASE_TAG" --notes-file notes.md
           fi
+
+      - name: Verify published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="open-design-${VERSION}-linux-x64.AppImage"
+          names="$(gh api "repos/${TARGET_REPO}/releases/tags/${RELEASE_TAG}" --jq '.assets[].name')"
+          printf '%s\n' "$names" | grep -qx "$asset" \
+            || { echo "::error::${asset} missing from ${RELEASE_TAG}"; exit 1; }
+          printf '%s\n' "$names" | grep -qx "$asset.sha256" \
+            || { echo "::error::${asset}.sha256 missing from ${RELEASE_TAG}"; exit 1; }
+          echo "Verified ${RELEASE_TAG}: ${asset} + sha256"

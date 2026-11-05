@@ -9,10 +9,12 @@
 流水线定义在 [`.github/workflows/build-linux.yml`](.github/workflows/build-linux.yml)：
 
 1. **定时触发**：每天 03:17 UTC；也可在 Actions 页面用 `workflow_dispatch` 手动运行。
-2. **解析 tag**：通过 GitHub REST API 分别拉取上游 `GET /repos/nexu-io/open-design/tags` 与本仓库的 tag 列表。取本仓库已有的最大 `vX.Y.Z` 作为**游标**，收集所有版本号大于游标的上游 tag（按版本升序）。
-3. **过滤**：跳过没有已发布上游 Release 的 tag；已存在于本仓库的 `vX.Y.Z` tag 也不再构建。
-4. **构建**：对每个待构建版本**依次**启动独立 job（`strategy.max-parallel: 1`），checkout 上游对应 tag → `pnpm install --frozen-lockfile` → `pnpm exec tools-pack linux build --portable --app-version <version> --to appimage`。
-5. **发布**：上传 AppImage 与 `.sha256` 校验文件；Release 描述首行是上游 Release 地址，其后是通过 API 获取的上游 Release 正文。
+2. **解析 tag**：通过 GitHub REST API 拉取上游 `GET /repos/nexu-io/open-design/tags`，以及本仓库 `GET /repos/forkdo/open-design-builder/releases`（含 assets）。
+3. **判定「已完成」**：只有**同时带 AppImage 与 `.sha256` 两个资产**的 Release 才算构建完成。`gh release create` 会先写 `vX.Y.Z` tag 再上传资产，所以只有 tag、资产不全的半截发布不能算数，否则游标会跳过它、永远不再重试。
+4. **求差集**：以最早的已完成版本为**下界（floor）**，收集所有不低于 floor、且没有完整 Release 的上游 tag（按版本升序）。既能一次补齐同日发布的多个 tag，也能补上中间失败留下的空洞，且不会回溯 floor 之前的古老版本。
+5. **过滤**：跳过没有已发布上游 Release 的 tag（发布描述需要它）。
+6. **构建**：对每个待构建版本**依次**启动独立 job（`max-parallel: 1`，升序）；`fail-fast: true` 保证任一版本失败就停下后续 job，避免后面的版本先发布、把游标推过这个空洞。
+7. **发布 + 校验**：上传 AppImage 与 `.sha256` 校验文件，随后再次调用 API 确认两个资产都确实存在，否则让该 job 失败。Release 描述首行是上游 Release 地址，其后是通过 API 获取的上游 Release 正文。
 
 ## 补打逻辑
 
@@ -27,9 +29,14 @@
 | `v0.1.1` | 是 | 新于游标 |
 | `v0.1.2` | 是 | 新于游标 |
 
-首次运行（本仓库还没有任何 `vX.Y.Z` tag）只构建上游最新版本，避免把几十个历史版本全部重放。如需补某个旧版本，用手动触发的 `tag` + `force`。
+首次运行（本仓库还没有任何完整 Release）只构建上游最新版本，避免把几十个历史版本全部重放。如需补某个旧版本，用手动触发的 `tag` + `force`。
 
-每次运行都会在 Actions 的 Step Summary 里打印游标和本次要构建的版本列表。
+两个额外保障：
+
+- **空洞**：若 `v0.1.0`、`v0.1.2` 已完成而 `v0.1.1` 缺失，差集会单独补出 `v0.1.1`，不会被「最大值游标」跳过。
+- **半截发布**：若某次上传失败只留下了 `v0.1.1` 的 tag（资产缺失），该版本不计入已完成，下一次运行会自动重试它以及之后的 `v0.1.2`。
+
+每次运行都会在 Actions 的 Step Summary 里打印游标（最新完整版本）、floor（最早完整版本）、完整 Release 数量，以及本次要构建的版本列表。
 
 ## 命名约定
 
@@ -47,7 +54,7 @@
 | 输入 | 说明 | 默认 |
 |---|---|---|
 | `tag` | 只构建单个版本，如 `v0.27.0`；留空则补打所有新版本 | 空 |
-| `force` | 配合 `tag` 使用：即使该 `vX.Y.Z` tag 已存在也强制重建并覆盖资产 | `false` |
+| `force` | 配合 `tag` 使用：即使该版本已有完整 Release 也强制重建并覆盖资产 | `false` |
 | `containerized` | 在 `electronuserland/builder:base` Docker 内构建，兼容更旧的 glibc | `false` |
 
 ## 运行 AppImage（FUSE）

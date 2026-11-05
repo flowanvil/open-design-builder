@@ -1,0 +1,175 @@
+name: Build Linux release from upstream tag
+
+on:
+  schedule:
+    # Daily at 03:17 UTC. Off-peak hour avoids the top-of-hour Actions queue.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to build (empty = latest open-design-v* tag)"
+        required: false
+        type: string
+      force:
+        description: "Rebuild even if a release for this tag already exists"
+        required: false
+        type: boolean
+        default: false
+      containerized:
+        description: "Build inside electronuserland/builder Docker for wider glibc compatibility"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: linux-release-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: nexu-io/open-design
+  TARGET_REPO: ${{ github.repository }}
+  NAMESPACE: release-linux
+
+jobs:
+  resolve:
+    name: Resolve upstream tag via API
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - name: Resolve tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          # Pull the tag list from the upstream repo through the GitHub REST API.
+          all_tags="$(gh api "repos/${UPSTREAM_REPO}/tags?per_page=100" --paginate --jq '.[].name')"
+          tag="$(printf '%s\n' "$all_tags" \
+            | grep -E '^open-design-v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -n 1 || true)"
+          if [ -n "${INPUT_TAG:-}" ]; then
+            tag="$INPUT_TAG"
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::No open-design-v* tag found in ${UPSTREAM_REPO}"
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#open-design-v}" >> "$GITHUB_OUTPUT"
+
+          # Release notes come from the matching upstream release, so a tag
+          # without a published release cannot be published here.
+          if ! gh api "repos/${UPSTREAM_REPO}/releases/tags/${tag}" >/dev/null 2>&1; then
+            echo "::notice::Upstream tag ${tag} has no published release; skipping."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Idempotent daily run: only build a tag that has no release here yet.
+          if [ "${FORCE:-false}" != "true" ] \
+            && gh api "repos/${TARGET_REPO}/releases/tags/${tag}" >/dev/null 2>&1; then
+            echo "::notice::Release ${tag} already exists in ${TARGET_REPO}; nothing to do."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build & publish ${{ needs.resolve.outputs.tag }}
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      CONTAINERIZED: ${{ inputs.containerized }}
+    steps:
+      - name: Checkout upstream source at tag
+        uses: actions/checkout@v4
+        with:
+          repository: nexu-io/open-design
+          ref: ${{ needs.resolve.outputs.tag }}
+          path: source
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Linux AppImage
+        working-directory: source
+        run: |
+          set -euo pipefail
+          args=(
+            exec tools-pack linux build
+            --dir "$RUNNER_TEMP/tools-pack"
+            --cache-dir "$RUNNER_TEMP/tools-pack-cache"
+            --namespace "$NAMESPACE"
+            --portable
+            --app-version "$VERSION"
+            --to appimage
+          )
+          if [ "${CONTAINERIZED:-false}" = "true" ]; then
+            args+=(--containerized)
+          fi
+          pnpm "${args[@]}"
+
+      - name: Prepare release assets
+        id: assets
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/tools-pack/out/linux/namespaces/$NAMESPACE/builder/Open Design-$NAMESPACE.AppImage"
+          test -f "$src" || { echo "::error::AppImage not found at $src"; exit 1; }
+          asset="open-design-${VERSION}-linux-x64.AppImage"
+          mkdir -p dist
+          cp "$src" "dist/$asset"
+          (cd dist && sha256sum "$asset" > "$asset.sha256")
+          ls -lh dist
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          meta="$(gh api "repos/${UPSTREAM_REPO}/releases/tags/${TAG}")"
+          release_name="$(printf '%s' "$meta" | jq -r '.name // empty')"
+          release_url="$(printf '%s' "$meta" | jq -r '.html_url')"
+          [ -n "$release_name" ] || release_name="$TAG"
+
+          # Upstream release URL first, then the upstream release description.
+          {
+            printf '%s\n\n' "$release_url"
+            printf '%s' "$meta" | jq -r '.body // ""'
+          } > notes.md
+
+          if gh release view "$TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$TARGET_REPO" --clobber
+            gh release edit "$TAG" --repo "$TARGET_REPO" \
+              --title "$release_name" --notes-file notes.md
+          else
+            gh release create "$TAG" dist/* --repo "$TARGET_REPO" \
+              --title "$release_name" --notes-file notes.md
+          fi

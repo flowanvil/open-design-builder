@@ -59,9 +59,20 @@ dlopen(): error loading libfuse.so.2
 AppImages require FUSE to run.
 ```
 
-这是 AppImage type-2 runtime 挂载 SquashFS 的固有依赖，**不是构建产物损坏，也不需要重新构建**。任选一种方式解决：
+这是 AppImage type-2 runtime 挂载 SquashFS 的固有依赖，**不是构建产物损坏，也不需要重新构建**。
 
-**方式一：安装 libfuse2（推荐，可直接运行）**
+**推荐：自解压模式（无需 FUSE，也是上游使用的启动方式）**
+
+```bash
+chmod +x open-design-0.27.0-linux-x64.AppImage
+./open-design-0.27.0-linux-x64.AppImage --appimage-extract-and-run
+# 或
+APPIMAGE_EXTRACT_AND_RUN=1 ./open-design-0.27.0-linux-x64.AppImage
+```
+
+该模式把 AppImage 解压到临时目录后运行，完全绕过 FUSE。上游 `tools-pack linux start` 固定使用这个方式：FUSE 挂载下加载 Node 模块（Express、better-sqlite3 等）会慢到让 daemon sidecar 稳定触发 `apps/packaged` 的 35 秒启动超时，而 extract-and-run 下启动在 5 秒内完成。所以即便系统装了 `libfuse2`，也建议用这个参数启动。
+
+**备选：安装 libfuse2 后直接运行**
 
 | 系统 | 命令 |
 |---|---|
@@ -69,20 +80,7 @@ AppImages require FUSE to run.
 | Ubuntu 22.04 及更早 / Debian 12 | `sudo apt install libfuse2` |
 | 其他发行版 | 安装对应的 `fuse2` / `libfuse2` 包（多数现代桌面发行版默认已带） |
 
-```bash
-chmod +x open-design-0.27.0-linux-x64.AppImage
-./open-design-0.27.0-linux-x64.AppImage
-```
-
-**方式二：不装 FUSE，用自解压模式**
-
-```bash
-./open-design-0.27.0-linux-x64.AppImage --appimage-extract-and-run
-# 或
-APPIMAGE_EXTRACT_AND_RUN=1 ./open-design-0.27.0-linux-x64.AppImage
-```
-
-该模式把 AppImage 解压到临时目录后运行，完全绕过 FUSE；上游 `tools-pack linux start` 也是用这个方式启动的。
+装好后可直接 `./open-design-0.27.0-linux-x64.AppImage`。
 
 > 校验文件：`sha256sum -c open-design-0.27.0-linux-x64.AppImage.sha256`。若下载工具给文件名加了后缀（例如 `..._8b2847e0b98bc5640c7ca2ffbe12153e.AppImage`），先改回上表中的标准文件名再校验，或直接 `sha256sum <文件>` 与 `.sha256` 内容比对。
 

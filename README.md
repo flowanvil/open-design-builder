@@ -9,10 +9,27 @@
 流水线定义在 [`.github/workflows/build-linux.yml`](.github/workflows/build-linux.yml)：
 
 1. **定时触发**：每天 03:17 UTC；也可在 Actions 页面用 `workflow_dispatch` 手动运行。
-2. **解析 tag**：通过 GitHub REST API `GET /repos/nexu-io/open-design/tags` 拉取上游 tag，筛选 `open-design-vX.Y.Z` 并取最新版本。
-3. **幂等检查**：若本仓库已存在对应 `vX.Y.Z` 的 Release 则跳过，除非手动触发时勾选 `force`。
-4. **构建**：checkout 上游对应 tag → `pnpm install --frozen-lockfile` → `pnpm exec tools-pack linux build --portable --app-version <version> --to appimage`。
+2. **解析 tag**：通过 GitHub REST API 分别拉取上游 `GET /repos/nexu-io/open-design/tags` 与本仓库的 tag 列表。取本仓库已有的最大 `vX.Y.Z` 作为**游标**，收集所有版本号大于游标的上游 tag（按版本升序）。
+3. **过滤**：跳过没有已发布上游 Release 的 tag；已存在于本仓库的 `vX.Y.Z` tag 也不再构建。
+4. **构建**：对每个待构建版本**依次**启动独立 job（`strategy.max-parallel: 1`），checkout 上游对应 tag → `pnpm install --frozen-lockfile` → `pnpm exec tools-pack linux build --portable --app-version <version> --to appimage`。
 5. **发布**：上传 AppImage 与 `.sha256` 校验文件；Release 描述首行是上游 Release 地址，其后是通过 API 获取的上游 Release 正文。
+
+## 补打逻辑
+
+同一天上游发布多个 tag 时不会出现漏打 — 所有比游标新的版本都会进入构建矩阵。
+
+例如本仓库已打 `v0.1.0`，上游有 `v0.0.9 / v0.1.0 / v0.1.1 / v0.1.2`：
+
+| 上游版本 | 是否构建 | 原因 |
+|---|---|---|
+| `v0.0.9` | 否 | 早于游标，不回溯历史 |
+| `v0.1.0` | 否 | 与游标相同，已构建 |
+| `v0.1.1` | 是 | 新于游标 |
+| `v0.1.2` | 是 | 新于游标 |
+
+首次运行（本仓库还没有任何 `vX.Y.Z` tag）只构建上游最新版本，避免把几十个历史版本全部重放。如需补某个旧版本，用手动触发的 `tag` + `force`。
+
+每次运行都会在 Actions 的 Step Summary 里打印游标和本次要构建的版本列表。
 
 ## 命名约定
 
@@ -29,9 +46,45 @@
 
 | 输入 | 说明 | 默认 |
 |---|---|---|
-| `tag` | 指定版本，如 `v0.27.0`；留空则取上游最新 tag | 空 |
-| `force` | 已有 Release 时仍重建并覆盖资产 | `false` |
+| `tag` | 只构建单个版本，如 `v0.27.0`；留空则补打所有新版本 | 空 |
+| `force` | 配合 `tag` 使用：即使该 `vX.Y.Z` tag 已存在也强制重建并覆盖资产 | `false` |
 | `containerized` | 在 `electronuserland/builder:base` Docker 内构建，兼容更旧的 glibc | `false` |
+
+## 运行 AppImage（FUSE）
+
+直接执行 AppImage 需要系统提供 `libfuse.so.2`。缺少时会报：
+
+```
+dlopen(): error loading libfuse.so.2
+AppImages require FUSE to run.
+```
+
+这是 AppImage type-2 runtime 挂载 SquashFS 的固有依赖，**不是构建产物损坏，也不需要重新构建**。任选一种方式解决：
+
+**方式一：安装 libfuse2（推荐，可直接运行）**
+
+| 系统 | 命令 |
+|---|---|
+| Ubuntu 24.04+ / Debian 13+ | `sudo apt install libfuse2t64` |
+| Ubuntu 22.04 及更早 / Debian 12 | `sudo apt install libfuse2` |
+| 其他发行版 | 安装对应的 `fuse2` / `libfuse2` 包（多数现代桌面发行版默认已带） |
+
+```bash
+chmod +x open-design-0.27.0-linux-x64.AppImage
+./open-design-0.27.0-linux-x64.AppImage
+```
+
+**方式二：不装 FUSE，用自解压模式**
+
+```bash
+./open-design-0.27.0-linux-x64.AppImage --appimage-extract-and-run
+# 或
+APPIMAGE_EXTRACT_AND_RUN=1 ./open-design-0.27.0-linux-x64.AppImage
+```
+
+该模式把 AppImage 解压到临时目录后运行，完全绕过 FUSE；上游 `tools-pack linux start` 也是用这个方式启动的。
+
+> 校验文件：`sha256sum -c open-design-0.27.0-linux-x64.AppImage.sha256`。若下载工具给文件名加了后缀（例如 `..._8b2847e0b98bc5640c7ca2ffbe12153e.AppImage`），先改回上表中的标准文件名再校验，或直接 `sha256sum <文件>` 与 `.sha256` 内容比对。
 
 ## 说明
 

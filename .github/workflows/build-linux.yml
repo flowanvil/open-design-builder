@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Version to build, e.g. v0.27.0 (empty = latest upstream tag)"
+        description: "Build one version, e.g. v0.27.0 (empty = backfill all newer tags)"
         required: false
         type: string
       force:
-        description: "Rebuild even if a release for this version already exists"
+        description: "With tag: rebuild even if that vX.Y.Z tag already exists"
         required: false
         type: boolean
         default: false
@@ -35,15 +35,14 @@ env:
 
 jobs:
   resolve:
-    name: Resolve upstream tag via API
+    name: Resolve tags to build via API
     runs-on: ubuntu-latest
     outputs:
-      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
-      release_tag: ${{ steps.resolve.outputs.release_tag }}
-      version: ${{ steps.resolve.outputs.version }}
-      build: ${{ steps.resolve.outputs.build }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      count: ${{ steps.resolve.outputs.count }}
+      cursor: ${{ steps.resolve.outputs.cursor }}
     steps:
-      - name: Resolve tag
+      - name: Resolve tags
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
@@ -52,68 +51,114 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Pull the tag list from the upstream repo through the GitHub REST API.
-          all_tags="$(gh api "repos/${UPSTREAM_REPO}/tags?per_page=100" --paginate --jq '.[].name')"
-          upstream_tag="$(printf '%s\n' "$all_tags" \
-            | grep -E '^open-design-v[0-9]+\.[0-9]+\.[0-9]+$' \
-            | sort -V | tail -n 1 || true)"
+          version_gt() {
+            local newer="$1" older="$2"
+            [ "$newer" != "$older" ] || return 1
+            [ "$(printf '%s\n%s\n' "$older" "$newer" | sort -V | tail -n 1)" = "$newer" ]
+          }
 
-          if [ -n "${INPUT_TAG:-}" ]; then
-            # Accept v0.27.0, 0.27.0 or open-design-v0.27.0.
-            version="$INPUT_TAG"
-            version="${version#open-design-v}"
-            version="${version#v}"
-            upstream_tag="open-design-v${version}"
-          else
-            version="${upstream_tag#open-design-v}"
-          fi
-          if [ -z "$upstream_tag" ]; then
-            echo "::error::No open-design-v* tag found in ${UPSTREAM_REPO}"
+          # Upstream stable tags -> bare versions, ascending.
+          upstream_raw="$(gh api "repos/${UPSTREAM_REPO}/tags?per_page=100" --paginate --jq '.[].name')"
+          mapfile -t upstream_versions < <(printf '%s\n' "$upstream_raw" \
+            | grep -E '^open-design-v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sed 's/^open-design-v//' | sort -V || true)
+          if [ "${#upstream_versions[@]}" -eq 0 ]; then
+            echo "::error::No open-design-vX.Y.Z tags found in ${UPSTREAM_REPO}"
             exit 1
           fi
 
-          # Builder-repo release tags and titles use the vx.y.z form, while the
-          # upstream checkout / release lookup still needs open-design-vx.y.z.
-          release_tag="v${version}"
-          echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
-          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # The highest vX.Y.Z tag already present in this repo is the cursor.
+          # Only upstream versions newer than it still need a release, so several
+          # tags published on the same day are all picked up, and older tags are
+          # never replayed.
+          built_raw="$(gh api "repos/${TARGET_REPO}/tags?per_page=100" --paginate --jq '.[].name')"
+          cursor="$(printf '%s\n' "$built_raw" \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sed 's/^v//' | sort -V | tail -n 1 || true)"
 
-          # Release notes come from the matching upstream release, so a tag
-          # without a published release cannot be published here.
-          if ! gh api "repos/${UPSTREAM_REPO}/releases/tags/${upstream_tag}" >/dev/null 2>&1; then
-            echo "::notice::Upstream tag ${upstream_tag} has no published release; skipping."
-            echo "build=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          if [ -n "${INPUT_TAG:-}" ]; then
+            # Accept v0.27.0, 0.27.0 or open-design-v0.27.0.
+            v="${INPUT_TAG#open-design-v}"
+            v="${v#v}"
+            candidates=("$v")
+          elif [ -z "$cursor" ]; then
+            # Fresh repo: bootstrap with only the newest upstream version instead
+            # of replaying the whole release history.
+            candidates=("${upstream_versions[-1]}")
+            echo "::notice::No vX.Y.Z tags in ${TARGET_REPO}; bootstrapping with ${candidates[0]}"
+          else
+            candidates=()
+            for v in "${upstream_versions[@]}"; do
+              if version_gt "$v" "$cursor"; then
+                candidates+=("$v")
+              fi
+            done
           fi
 
-          # Idempotent daily run: only build a version that has no release here yet.
-          if [ "${FORCE:-false}" != "true" ] \
-            && gh api "repos/${TARGET_REPO}/releases/tags/${release_tag}" >/dev/null 2>&1; then
-            echo "::notice::Release ${release_tag} already exists in ${TARGET_REPO}; nothing to do."
-            echo "build=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          matrix='{"include":[]}'
+          count=0
+          for v in "${candidates[@]}"; do
+            [ -n "$v" ] || continue
+            upstream_tag="open-design-v${v}"
+            release_tag="v${v}"
 
-          echo "build=true" >> "$GITHUB_OUTPUT"
+            # Release notes come from the matching upstream release.
+            if ! gh api "repos/${UPSTREAM_REPO}/releases/tags/${upstream_tag}" >/dev/null 2>&1; then
+              echo "::notice::${upstream_tag}: no published upstream release, skipping"
+              continue
+            fi
+
+            # Idempotency: an already-tagged version is left alone unless forced.
+            if [ "${FORCE:-false}" != "true" ] \
+              && printf '%s\n' "$built_raw" | grep -qx "v${v}"; then
+              echo "::notice::${release_tag}: already tagged in ${TARGET_REPO}, skipping"
+              continue
+            fi
+
+            matrix="$(printf '%s' "$matrix" | jq -c \
+              --arg upstream_tag "$upstream_tag" \
+              --arg release_tag "$release_tag" \
+              --arg version "$v" \
+              '.include += [{upstream_tag:$upstream_tag, release_tag:$release_tag, version:$version}]')"
+            count=$((count + 1))
+          done
+
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "cursor=${cursor:-none}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Tags to build"
+            echo "Cursor (latest tag in this repo): \`${cursor:-none}\`"
+            if [ "$count" -eq 0 ]; then
+              echo "Nothing to do — every upstream tag up to the cursor already has a release."
+            else
+              printf '%s' "$matrix" | jq -r '.include[].release_tag' | sed 's/^/- `/; s/$/`/'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
-    name: Build & publish ${{ needs.resolve.outputs.release_tag }}
+    name: Build & publish ${{ matrix.release_tag }}
     needs: resolve
-    if: needs.resolve.outputs.build == 'true'
+    if: needs.resolve.outputs.count != '0'
+    strategy:
+      # One runner at a time, in version order — "依次打入" the missing tags.
+      max-parallel: 1
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
-      UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
-      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
-      VERSION: ${{ needs.resolve.outputs.version }}
+      UPSTREAM_TAG: ${{ matrix.upstream_tag }}
+      RELEASE_TAG: ${{ matrix.release_tag }}
+      VERSION: ${{ matrix.version }}
       CONTAINERIZED: ${{ inputs.containerized }}
     steps:
       - name: Checkout upstream source at tag
         uses: actions/checkout@v4
         with:
           repository: nexu-io/open-design
-          ref: ${{ needs.resolve.outputs.upstream_tag }}
+          ref: ${{ matrix.upstream_tag }}
           path: source
 
       - name: Setup pnpm

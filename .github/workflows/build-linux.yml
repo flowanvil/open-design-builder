@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Upstream tag to build (empty = latest open-design-v* tag)"
+        description: "Version to build, e.g. v0.27.0 (empty = latest upstream tag)"
         required: false
         type: string
       force:
-        description: "Rebuild even if a release for this tag already exists"
+        description: "Rebuild even if a release for this version already exists"
         required: false
         type: boolean
         default: false
@@ -38,7 +38,8 @@ jobs:
     name: Resolve upstream tag via API
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.resolve.outputs.tag }}
+      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
       version: ${{ steps.resolve.outputs.version }}
       build: ${{ steps.resolve.outputs.build }}
     steps:
@@ -53,32 +54,43 @@ jobs:
 
           # Pull the tag list from the upstream repo through the GitHub REST API.
           all_tags="$(gh api "repos/${UPSTREAM_REPO}/tags?per_page=100" --paginate --jq '.[].name')"
-          tag="$(printf '%s\n' "$all_tags" \
+          upstream_tag="$(printf '%s\n' "$all_tags" \
             | grep -E '^open-design-v[0-9]+\.[0-9]+\.[0-9]+$' \
             | sort -V | tail -n 1 || true)"
+
           if [ -n "${INPUT_TAG:-}" ]; then
-            tag="$INPUT_TAG"
+            # Accept v0.27.0, 0.27.0 or open-design-v0.27.0.
+            version="$INPUT_TAG"
+            version="${version#open-design-v}"
+            version="${version#v}"
+            upstream_tag="open-design-v${version}"
+          else
+            version="${upstream_tag#open-design-v}"
           fi
-          if [ -z "$tag" ]; then
+          if [ -z "$upstream_tag" ]; then
             echo "::error::No open-design-v* tag found in ${UPSTREAM_REPO}"
             exit 1
           fi
 
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=${tag#open-design-v}" >> "$GITHUB_OUTPUT"
+          # Builder-repo release tags and titles use the vx.y.z form, while the
+          # upstream checkout / release lookup still needs open-design-vx.y.z.
+          release_tag="v${version}"
+          echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
           # Release notes come from the matching upstream release, so a tag
           # without a published release cannot be published here.
-          if ! gh api "repos/${UPSTREAM_REPO}/releases/tags/${tag}" >/dev/null 2>&1; then
-            echo "::notice::Upstream tag ${tag} has no published release; skipping."
+          if ! gh api "repos/${UPSTREAM_REPO}/releases/tags/${upstream_tag}" >/dev/null 2>&1; then
+            echo "::notice::Upstream tag ${upstream_tag} has no published release; skipping."
             echo "build=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Idempotent daily run: only build a tag that has no release here yet.
+          # Idempotent daily run: only build a version that has no release here yet.
           if [ "${FORCE:-false}" != "true" ] \
-            && gh api "repos/${TARGET_REPO}/releases/tags/${tag}" >/dev/null 2>&1; then
-            echo "::notice::Release ${tag} already exists in ${TARGET_REPO}; nothing to do."
+            && gh api "repos/${TARGET_REPO}/releases/tags/${release_tag}" >/dev/null 2>&1; then
+            echo "::notice::Release ${release_tag} already exists in ${TARGET_REPO}; nothing to do."
             echo "build=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -86,13 +98,14 @@ jobs:
           echo "build=true" >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build & publish ${{ needs.resolve.outputs.tag }}
+    name: Build & publish ${{ needs.resolve.outputs.release_tag }}
     needs: resolve
     if: needs.resolve.outputs.build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
-      TAG: ${{ needs.resolve.outputs.tag }}
+      UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
       VERSION: ${{ needs.resolve.outputs.version }}
       CONTAINERIZED: ${{ inputs.containerized }}
     steps:
@@ -100,7 +113,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: nexu-io/open-design
-          ref: ${{ needs.resolve.outputs.tag }}
+          ref: ${{ needs.resolve.outputs.upstream_tag }}
           path: source
 
       - name: Setup pnpm
@@ -138,11 +151,11 @@ jobs:
           pnpm "${args[@]}"
 
       - name: Prepare release assets
-        id: assets
         run: |
           set -euo pipefail
           src="$RUNNER_TEMP/tools-pack/out/linux/namespaces/$NAMESPACE/builder/Open Design-$NAMESPACE.AppImage"
           test -f "$src" || { echo "::error::AppImage not found at $src"; exit 1; }
+          # Same naming as the upstream mac/win release assets.
           asset="open-design-${VERSION}-linux-x64.AppImage"
           mkdir -p dist
           cp "$src" "dist/$asset"
@@ -154,10 +167,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          meta="$(gh api "repos/${UPSTREAM_REPO}/releases/tags/${TAG}")"
-          release_name="$(printf '%s' "$meta" | jq -r '.name // empty')"
+          meta="$(gh api "repos/${UPSTREAM_REPO}/releases/tags/${UPSTREAM_TAG}")"
           release_url="$(printf '%s' "$meta" | jq -r '.html_url')"
-          [ -n "$release_name" ] || release_name="$TAG"
 
           # Upstream release URL first, then the upstream release description.
           {
@@ -165,11 +176,11 @@ jobs:
             printf '%s' "$meta" | jq -r '.body // ""'
           } > notes.md
 
-          if gh release view "$TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --repo "$TARGET_REPO" --clobber
-            gh release edit "$TAG" --repo "$TARGET_REPO" \
-              --title "$release_name" --notes-file notes.md
+          if gh release view "$RELEASE_TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --repo "$TARGET_REPO" --clobber
+            gh release edit "$RELEASE_TAG" --repo "$TARGET_REPO" \
+              --title "$RELEASE_TAG" --notes-file notes.md
           else
-            gh release create "$TAG" dist/* --repo "$TARGET_REPO" \
-              --title "$release_name" --notes-file notes.md
+            gh release create "$RELEASE_TAG" dist/* --repo "$TARGET_REPO" \
+              --title "$RELEASE_TAG" --notes-file notes.md
           fi

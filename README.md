@@ -88,6 +88,33 @@ APPIMAGE_EXTRACT_AND_RUN=1 ./open-design-0.27.0-linux-x64.AppImage
 
 > 校验文件：`sha256sum -c open-design-0.27.0-linux-x64.AppImage.sha256`。若下载工具给文件名加了后缀（例如 `..._8b2847e0b98bc5640c7ca2ffbe12153e.AppImage`），先改回上表中的标准文件名再校验，或直接 `sha256sum <文件>` 与 `.sha256` 内容比对。
 
+## 开始菜单启动（.desktop）
+
+**终端里 `./xxx.AppImage` 正常、从开始菜单却闪退**，几乎都是 `.desktop` 的 `Exec` 写法问题（且 `Terminal=false` 会把错误吞掉）。桌面会话不继承 shell 环境，与终端有三个差异：
+
+1. 缺 `--appimage-extract-and-run` → 走 FUSE 挂载；FUSE 不可用或挂载太慢时直接失败。
+2. `ELECTRON_RUN_AS_NODE` 可能从会话环境泄漏进来 → Electron 以纯 Node 模式启动，不开窗、立即退出。
+3. `%U` 无 URL 时某些桌面环境会展开成**空参数** → Electron 收到空 argv 立即退出。
+4. AppImage 内嵌的 `.desktop` 里是 `Exec=AppRun --no-sandbox %U`，`AppRun` 是 AppDir 内的相对命令；直接把它复制到菜单会因 PATH 找不到而闪退。
+
+**推荐：用 Release 里的安装脚本**（与上游 `installPackedLinuxApp` 生成的 Exec 一致）：
+
+```bash
+# 把 AppImage 和 install 脚本放在同一目录
+chmod +x open-design-0.27.0-linux-x64-install.sh
+./open-design-0.27.0-linux-x64-install.sh
+```
+
+脚本会把 AppImage 装到 `~/.local/bin/open-design.AppImage`，并生成 `~/.local/share/applications/open-design.desktop`：
+
+```ini
+Exec=env -u ELECTRON_RUN_AS_NODE /home/<user>/.local/bin/open-design.AppImage --appimage-extract-and-run %U
+```
+
+**手写 .desktop 时**，`Exec` 必须满足：绝对路径 + `--appimage-extract-and-run` + `env -u ELECTRON_RUN_AS_NODE`，并且**不要**用 `AppRun`。构建产物里的 `AppRun` 已过滤 `%U` 展开出的空参数，也能把相对 `APPIMAGE` 解析为绝对路径。
+
+**仍闪退时先抓日志**：把 `.desktop` 临时改成 `Terminal=true`（或 `Exec` 前加 `sh -c '... >~/od.log 2>&1'`），重跑后看输出。
+
 ## 构建期补丁
 
 上游 Linux 打包路径有两个已知问题，本流水线在 checkout 上游 tag 之后、`pnpm install` 之前用带 anchor 校验的 Python 脚本打补丁；上游源码结构一旦变化，CI 会直接失败而不是静默产出坏包。

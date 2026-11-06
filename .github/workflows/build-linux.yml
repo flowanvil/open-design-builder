@@ -184,6 +184,11 @@ jobs:
       VERSION: ${{ matrix.version }}
       CONTAINERIZED: ${{ inputs.containerized }}
     steps:
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+        with:
+          path: builder
+
       - name: Checkout upstream source at tag
         uses: actions/checkout@v4
         with:
@@ -208,14 +213,27 @@ jobs:
           args=("$@")
           NUMBER_OF_ARGS="$#"
 
+          # Desktop entries may expand %U to an empty string. An empty argv entry
+          # makes Chromium/Electron exit immediately, so drop it for BOTH launch
+          # modes (FUSE re-exec and direct extracted execution).
+          forward=()
+          for a in "\${args[@]}"; do
+            if [ -n "\$a" ]; then forward+=("\$a"); fi
+          done
+          args=("\${forward[@]}")
+          NUMBER_OF_ARGS="\${#args[@]}"
+
           # A direct FUSE-mounted AppImage launch demand-pages the bundled Node payload
           # through a cold squashfs on every start, so the packaged sidecar misses its
           # startup budget (see upstream tools/pack README). Re-exec the outer AppImage
           # in extract-and-run mode so the payload runs from a real filesystem. Extracted
           # runs keep OD_APPIMAGE_FALLBACK in the environment and skip this branch.
-          if [ -z "\${OD_APPIMAGE_FALLBACK:-}" ] && [ -n "\${APPIMAGE:-}" ] && [ -x "\${APPIMAGE}" ] && [[ "\${APPDIR:-}" == /tmp/.mount_* ]]; then
-            export OD_APPIMAGE_FALLBACK=1
-            exec "\${APPIMAGE}" --appimage-extract-and-run "\${args[@]}"
+          if [ -z "\${OD_APPIMAGE_FALLBACK:-}" ] && [ -n "\${APPIMAGE:-}" ] && [[ "\${APPDIR:-}" == /tmp/.mount_* ]]; then
+            target="\$(readlink -f "\${APPIMAGE}" 2>/dev/null || true)"
+            if [ -n "\$target" ] && [ -x "\$target" ]; then
+              export OD_APPIMAGE_FALLBACK=1
+              exec "\$target" --appimage-extract-and-run "\${args[@]}"
+            fi
           fi
           '''
           path.write_text(src.replace(anchor, patch, 1))
@@ -299,6 +317,13 @@ jobs:
           mkdir -p dist
           cp "$src" "dist/$asset"
           (cd dist && sha256sum "$asset" > "$asset.sha256")
+          # Ship a ready-to-use desktop installer. A hand-written .desktop whose
+          # Exec lacks --appimage-extract-and-run (or inherits
+          # ELECTRON_RUN_AS_NODE) starts and immediately exits from the menu.
+          install_script="builder/scripts/install-linux.sh"
+          test -f "$install_script" || { echo "::error::install script missing"; exit 1; }
+          cp "$install_script" "dist/open-design-${VERSION}-linux-x64-install.sh"
+          chmod +x "dist/open-design-${VERSION}-linux-x64-install.sh"
           ls -lh dist
 
       - name: Publish GitHub Release

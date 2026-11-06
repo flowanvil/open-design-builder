@@ -191,6 +191,37 @@ jobs:
           ref: ${{ matrix.upstream_tag }}
           path: source
 
+      - name: Patch AppRun to fall back to extract-and-run
+        working-directory: source
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("tools/pack/src/linux.ts")
+          src = path.read_text()
+          anchor = 'THIS="$0"\nargs=("$@")\nNUMBER_OF_ARGS="$#"\n'
+          if src.count(anchor) != 1:
+              raise SystemExit("::error::AppRun template changed; cannot apply extract-and-run patch")
+
+          patch = r'''THIS="$0"
+          args=("$@")
+          NUMBER_OF_ARGS="$#"
+
+          # A direct FUSE-mounted AppImage launch demand-pages the bundled Node payload
+          # through a cold squashfs on every start, so the packaged sidecar misses its
+          # startup budget (see upstream tools/pack README). Re-exec the outer AppImage
+          # in extract-and-run mode so the payload runs from a real filesystem. Extracted
+          # runs keep OD_APPIMAGE_FALLBACK in the environment and skip this branch.
+          if [ -z "\${OD_APPIMAGE_FALLBACK:-}" ] && [ -n "\${APPIMAGE:-}" ] && [ -x "\${APPIMAGE}" ] && [[ "\${APPDIR:-}" == /tmp/.mount_* ]]; then
+            export OD_APPIMAGE_FALLBACK=1
+            exec "\${APPIMAGE}" --appimage-extract-and-run "\${args[@]}"
+          fi
+          '''
+          path.write_text(src.replace(anchor, patch, 1))
+          PY
+          grep -n "OD_APPIMAGE_FALLBACK" tools/pack/src/linux.ts
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -230,6 +261,11 @@ jobs:
           set -euo pipefail
           src="$RUNNER_TEMP/tools-pack/out/linux/namespaces/$NAMESPACE/builder/Open Design-$NAMESPACE.AppImage"
           test -f "$src" || { echo "::error::AppImage not found at $src"; exit 1; }
+          # The AppRun packed into the AppImage must carry the FUSE fallback,
+          # otherwise a plain `./xxx.AppImage` launch still fails at the sidecar.
+          apprun="$RUNNER_TEMP/tools-pack/out/linux/namespaces/$NAMESPACE/appimage/AppRun"
+          grep -q "OD_APPIMAGE_FALLBACK" "$apprun" \
+            || { echo "::error::AppRun is missing the extract-and-run fallback"; exit 1; }
           # Same naming as the upstream mac/win release assets.
           asset="open-design-${VERSION}-linux-x64.AppImage"
           mkdir -p dist

@@ -57,37 +57,34 @@
 | `force` | 配合 `tag` 使用：即使该版本已有完整 Release 也强制重建并覆盖资产 | `false` |
 | `containerized` | 在 `electronuserland/builder:base` Docker 内构建，兼容更旧的 glibc | `false` |
 
-## 运行 AppImage（FUSE）
+## 运行 AppImage（FUSE / sidecar）
 
-直接执行 AppImage 需要系统提供 `libfuse.so.2`。缺少时会报：
+AppImage 直接执行依赖两段机制，缺一段都会失败：
 
-```
-dlopen(): error loading libfuse.so.2
-AppImages require FUSE to run.
-```
+| 现象 | 原因 |
+|---|---|
+| `dlopen(): error loading libfuse.so.2` / `AppImages require FUSE to run` | 系统缺 `libfuse.so.2`，AppImage runtime 无法挂载 SquashFS |
+| `SidecarBootstrapGenerationRetiredError: sidecar bootstrap generation ... exited before a generation became ready`（日志里路径是 `/tmp/.mount_...`） | **已挂载但走的是 FUSE 模式**：每次启动页缓存都是冷的，内置 Node 负载通过 FUSE 按需换页，daemon sidecar 稳定错过启动预算（`apps/packaged/src/sidecars.ts` 把 Linux 预算放宽到 90s 仍可能不够） |
 
-这是 AppImage type-2 runtime 挂载 SquashFS 的固有依赖，**不是构建产物损坏，也不需要重新构建**。
+两者都**不是构建产物损坏**。上游 `tools-pack linux start` 固定用 `--appimage-extract-and-run`，实测启动从 >35s 降到 <5s。
 
-**推荐：自解压模式（无需 FUSE，也是上游使用的启动方式）**
+**本仓库的构建已在 `AppRun` 里加了自动兜底**：直接 `./xxx.AppImage` 时，若检测到自己运行在 FUSE 挂载点 `/tmp/.mount_*` 下，会用 `OD_APPIMAGE_FALLBACK` 标记并自动以 `--appimage-extract-and-run` 重新执行外层 AppImage。所以只要系统能完成首次挂载（有 `libfuse2`），直接双击/命令行运行就会自动切到真实文件系统，sidecar 正常启动。解压后的那一次执行因为 `APPDIR` 不再是 `/tmp/.mount_*`，不会递归。CI 里会断言生成的 `AppRun` 带有这段兜底，防止上游模板变动后静默失效。
+
+**完全没有 libfuse2 时**（连首次挂载都失败），runtime 在 `AppRun` 之前就退出，兜底来不及生效，仍需手动指定：
 
 ```bash
-chmod +x open-design-0.27.0-linux-x64.AppImage
 ./open-design-0.27.0-linux-x64.AppImage --appimage-extract-and-run
 # 或
 APPIMAGE_EXTRACT_AND_RUN=1 ./open-design-0.27.0-linux-x64.AppImage
 ```
 
-该模式把 AppImage 解压到临时目录后运行，完全绕过 FUSE。上游 `tools-pack linux start` 固定使用这个方式：FUSE 挂载下加载 Node 模块（Express、better-sqlite3 等）会慢到让 daemon sidecar 稳定触发 `apps/packaged` 的 35 秒启动超时，而 extract-and-run 下启动在 5 秒内完成。所以即便系统装了 `libfuse2`，也建议用这个参数启动。
-
-**备选：安装 libfuse2 后直接运行**
+也可以装好 FUSE 后直接运行：
 
 | 系统 | 命令 |
 |---|---|
 | Ubuntu 24.04+ / Debian 13+ | `sudo apt install libfuse2t64` |
 | Ubuntu 22.04 及更早 / Debian 12 | `sudo apt install libfuse2` |
 | 其他发行版 | 安装对应的 `fuse2` / `libfuse2` 包（多数现代桌面发行版默认已带） |
-
-装好后可直接 `./open-design-0.27.0-linux-x64.AppImage`。
 
 > 校验文件：`sha256sum -c open-design-0.27.0-linux-x64.AppImage.sha256`。若下载工具给文件名加了后缀（例如 `..._8b2847e0b98bc5640c7ca2ffbe12153e.AppImage`），先改回上表中的标准文件名再校验，或直接 `sha256sum <文件>` 与 `.sha256` 内容比对。
 

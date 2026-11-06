@@ -88,6 +88,17 @@ APPIMAGE_EXTRACT_AND_RUN=1 ./open-design-0.27.0-linux-x64.AppImage
 
 > 校验文件：`sha256sum -c open-design-0.27.0-linux-x64.AppImage.sha256`。若下载工具给文件名加了后缀（例如 `..._8b2847e0b98bc5640c7ca2ffbe12153e.AppImage`），先改回上表中的标准文件名再校验，或直接 `sha256sum <文件>` 与 `.sha256` 内容比对。
 
+## 构建期补丁
+
+上游 Linux 打包路径有两个已知问题，本流水线在 checkout 上游 tag 之后、`pnpm install` 之前用带 anchor 校验的 Python 脚本打补丁；上游源码结构一旦变化，CI 会直接失败而不是静默产出坏包。
+
+| 补丁 | 文件 | 原因 |
+|---|---|---|
+| AppRun 自动 extract-and-run | `tools/pack/src/linux.ts` | 见上一节：FUSE 直挂页缓存冷，sidecar 启动预算不稳定 |
+| next.config 指纹守卫 | `apps/web/next.config.ts` | Linux 固定用 `webOutputMode: server`，会把 `@open-design/web/src` 一起打包。运行时 `next.config.ts` 的守卫只检查 `src/components/touchpoint-component.ts` 是否存在（打包后仍存在），于是继续读取 `apps/web/app/layout.tsx` 等只存在于 monorepo 的文件 → `ENOENT` → **web sidecar 启动即崩** → `SidecarBootstrapGenerationRetiredError`。改为「所有指纹输入文件都存在时才计算」：源码检出时行为不变，打包产物里直接返回 `undefined` |
+
+`Prepare release assets` 会断言生成的 `AppRun` 和打包后的 `next.config.ts` 确实带有这两个补丁。
+
 ## 说明
 
 - Workflow 使用仓库自带的 `GITHUB_TOKEN`，需要 `contents: write` 权限（已在 workflow 中声明）。

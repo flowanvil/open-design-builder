@@ -222,6 +222,29 @@ jobs:
           PY
           grep -n "OD_APPIMAGE_FALLBACK" tools/pack/src/linux.ts
 
+      - name: Patch web next.config fingerprint guard
+        working-directory: source
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # Linux packs in `server` mode and therefore ships @open-design/web/src.
+          # That makes next.config.ts's guard (one source file exists) pass at
+          # runtime, after which it tries to read monorepo-only files such as
+          # apps/web/app/layout.tsx, so the web sidecar dies on boot and the
+          # whole sidecar generation is retired. Only compute the build-time
+          # fingerprint when ALL inputs are present (i.e. in a source checkout).
+          path = Path("apps/web/next.config.ts")
+          src = path.read_text()
+          old = "existsSync(resolve(WEB_ROOT, 'src/components/touchpoint-component.ts'))"
+          new = "CMS_HOST_RELEASE_INPUTS.every((file) => existsSync(resolve(WORKSPACE_ROOT, file)))"
+          if src.count(old) != 1:
+              raise SystemExit("::error::next.config fingerprint guard changed; cannot apply packaged-runtime fix")
+          path.write_text(src.replace(old, new, 1))
+          PY
+          grep -n "CMS_HOST_RELEASE_INPUTS.every" apps/web/next.config.ts
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -266,6 +289,11 @@ jobs:
           apprun="$RUNNER_TEMP/tools-pack/out/linux/namespaces/$NAMESPACE/appimage/AppRun"
           grep -q "OD_APPIMAGE_FALLBACK" "$apprun" \
             || { echo "::error::AppRun is missing the extract-and-run fallback"; exit 1; }
+          # The packaged web config must carry the runtime-safe fingerprint guard,
+          # otherwise the web sidecar cannot boot and the generation is retired.
+          webconfig="$RUNNER_TEMP/tools-pack/out/linux/namespaces/$NAMESPACE/assembled/app/node_modules/@open-design/web/next.config.ts"
+          grep -q "CMS_HOST_RELEASE_INPUTS.every" "$webconfig" \
+            || { echo "::error::packaged web config is missing the fingerprint guard fix"; exit 1; }
           # Same naming as the upstream mac/win release assets.
           asset="open-design-${VERSION}-linux-x64.AppImage"
           mkdir -p dist

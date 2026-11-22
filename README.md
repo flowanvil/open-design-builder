@@ -123,6 +123,7 @@ Exec=env -u ELECTRON_RUN_AS_NODE /home/<user>/.local/bin/open-design.AppImage --
 |---|---|---|
 | AppRun 自动 extract-and-run | `tools/pack/src/linux.ts` | 见上一节：FUSE 直挂页缓存冷，sidecar 启动预算不稳定 |
 | next.config 指纹守卫 | `apps/web/next.config.ts` | Linux 固定用 `webOutputMode: server`，会把 `@open-design/web/src` 一起打包。运行时 `next.config.ts` 的守卫只检查 `src/components/touchpoint-component.ts` 是否存在（打包后仍存在），于是继续读取 `apps/web/app/layout.tsx` 等只存在于 monorepo 的文件 → `ENOENT` → **web sidecar 启动即崩** → `SidecarBootstrapGenerationRetiredError`。改为「所有指纹输入文件都存在时才计算」：源码检出时行为不变，打包产物里直接返回 `undefined` |
+| 跳过 onnxruntime CUDA 下载 | 环境变量 / `~/.npmrc` | `apps/daemon` 依赖的 `hyperframes` 引入了 `onnxruntime-node`。打包期 `npm install` 会在 Linux x64 环境下触发其 postinstall 脚本尝试下载 `onnxruntime-linux-x64-gpu-*.tgz`，因上游 release 无该资源而报 404 导致构建中断。通过配置 `ONNXRUNTIME_NODE_INSTALL_CUDA=skip` 跳过 GPU 二进制下载（AppImage 仅需 CPU 推理） |
 
 `Prepare release assets` 会断言生成的 `AppRun` 和打包后的 `next.config.ts` 确实带有这两个补丁。
 

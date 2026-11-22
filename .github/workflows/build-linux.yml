@@ -183,6 +183,14 @@ jobs:
       RELEASE_TAG: ${{ matrix.release_tag }}
       VERSION: ${{ matrix.version }}
       CONTAINERIZED: ${{ inputs.containerized }}
+      # onnxruntime-node attempts to download Linux CUDA EP binaries during
+      # npm install in assembled/app, which fails with 404 because upstream
+      # onnxruntime does not publish onnxruntime-linux-x64-gpu-<version>.tgz.
+      # The packaged AppImage uses CPU inference, so skip CUDA binary downloads.
+      ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+      npm_config_onnxruntime_node_install_cuda: skip
+      ONNXRUNTIME_NODE_INSTALL: skip
+      npm_config_onnxruntime_node_install: skip
     steps:
       - name: Checkout builder repo
         uses: actions/checkout@v4
@@ -283,6 +291,9 @@ jobs:
         working-directory: source
         run: |
           set -euo pipefail
+          # Suppress onnxruntime-node CUDA EP binary downloads for all npm invocations
+          echo "onnxruntime-node-install-cuda=skip" >> ~/.npmrc
+          echo "onnxruntime-node-install=skip" >> ~/.npmrc
           args=(
             exec tools-pack linux build
             --dir "$RUNNER_TEMP/tools-pack"

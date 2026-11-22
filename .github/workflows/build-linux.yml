@@ -4,6 +4,9 @@ on:
   schedule:
     # Daily at 03:17 UTC. Off-peak hour avoids the top-of-hour Actions queue.
     - cron: "17 3 * * *"
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       tag:
